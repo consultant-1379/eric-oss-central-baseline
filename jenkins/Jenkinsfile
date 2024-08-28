@@ -1,0 +1,341 @@
+@Library('eric-oss-central-utils-shared-library')
+@Library('son-dev-utils-shared-library@dIncludeDependentServices')
+import jenkins.utils.*
+
+utils = new utils()     // https://gerrit.ericsson.se/gitweb?p=OSS/com.ericsson.oss.services.sonom/son-dev-utils.git;a=blob_plain;f=src/jenkins/utils/utils.groovy;hb=master
+helmUtils = new helmChartVersionCheck()     // https://gerrit.sero.gic.ericsson.se/gitweb?p=OSS/com.ericsson.oss.ci/eric-oss-central-utils.git;a=blob_plain;f=src/jenkins/utils/helm_chart_version_check.groovy;hb=master
+
+// The following service versions are frozen. Latest versions for these service will be tested, however the version changes will not be committed.
+def staticAdpServiceVersions = ['eric-data-coordinator-zk', 'eric-data-message-bus-kf','eric-pm-server','eric-data-engine-sk','eric-log-shipper','eric-data-search-engine','eric-log-transformer']
+
+def current_stage = ''
+
+pipeline {
+    agent {
+        node {
+            label 'Jenkins_gazelles_podj'
+        }
+    }
+    options {
+        skipDefaultCheckout true
+        timestamps()
+        timeout(time: 150, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '40', artifactNumToKeepStr: '10'))
+    }
+    parameters {
+        string(name: 'CHART_NAME', defaultValue: '')
+        string(name: 'CHART_VERSION', defaultValue: '')
+        string(name: 'CHART_REPO', defaultValue: '')
+        string(name: 'SERVER_KUBE_CONFIG', defaultValue: "kube.config.c07a015",description: 'Enter the precode kube config')
+
+    }
+    environment {
+        APPLICATION_NAME = "eric-oss-central-baseline"
+        CREDENTIALS_SEKA_ARTIFACTORY = credentials('osscnciArtifactoryApiKeySELI')
+        CREDENTIALS_SERO_ARTIFACTORY = credentials('osscnciArtifactoryApiKeySERO')
+        KUBECTL_CMD = "docker run --rm \
+            -v ${env.WORKSPACE}/.kube/config:/root/.kube/config \
+            -v ${env.WORKSPACE}:${env.WORKSPACE} \
+            ${KUBECTL_DOCKER_IMAGE}"
+        HELM_CMD = "docker run --rm \
+            -v ${env.WORKSPACE}/.kube/config:/root/.kube/config \
+            -v ${env.WORKSPACE}/helm-home:/root/.helm \
+            -v ${env.WORKSPACE}:${env.WORKSPACE} \
+            ${env.HELM_DOCKER_IMAGE}"
+        HELM_SET = "global.registry.pullSecret=${APPLICATION_NAME}-secret,eric-enm-monitoring-master.monitoring.autoUpload.enabled=false,eric-spark-cluster.imageCredentials.registry.pullSecret=${APPLICATION_NAME}-secret,eric-pm-stats-processor-er.spark.imageCredentials.registry.pullSecret=${APPLICATION_NAME}-secret,eric-pm-events-processor-er.schemaregistry.imageCredentials.registry.pullSecret=${APPLICATION_NAME}-secret,eric-pm-events-processor-er.spark.imageCredentials.registry.pullSecret=${APPLICATION_NAME}-secret,eric-pm-kpi-calculator.spark.imageCredentials.registry.pullSecret=${APPLICATION_NAME}-secret"
+        HELM_CHART_REPO = "https://arm.seli.gic.ericsson.se/artifactory/proj-eric-oss-central-drop-helm"
+        HELM_CHART_DIR = "${env.WORKSPACE}/charts/${APPLICATION_NAME}"
+        HELM_INSTALL_NAMESPACE = "${APPLICATION_NAME}-staging"
+        HELM_INSTALL_TIMEOUT = 1800
+
+        HELM_DEPENDENCY_CHANGED = false
+    }
+    stages {
+        stage('Update Dependent Services') {
+            when {
+                allOf {
+                    expression { params.CHART_NAME != "" }
+                    expression { params.CHART_VERSION.contains("+") }
+                    expression { !utils.mapOfServiceDependencies(CHART_NAME).isEmpty() }
+                    expression { !staticAdpServiceVersions.contains(params.CHART_NAME) }
+                    expression { !params.ADPGS_AUTO_UPDATE_DISABLED }
+                }
+            }
+            steps {
+                script {
+
+                    current_stage = env.STAGE_NAME
+                    currentBuild.description = "Triggered by ${CHART_NAME}:${CHART_VERSION}"
+
+                    echo "Triggering the dependent services: ${utils.mapOfServiceDependencies(CHART_NAME)}"
+                }
+            }
+        }
+        stage('Clean') {
+            steps {
+                script {
+                    current_stage = env.STAGE_NAME
+                }
+                sh '''
+                    echo "Cleanup workspace:"
+                    sudo chmod -fR 777 "${WORKSPACE}"
+                    sudo rm -Rf ./*
+                '''
+
+                echo 'SCM Checkout:'
+                checkout scm
+            }
+        }
+        stage('Init') {
+            steps {
+                script {
+                    current_stage = env.STAGE_NAME
+                }
+                sh "mkdir helm-home"
+
+                echo 'Inject Gazelle K8s Config File:'
+                script {
+                    injectK8sFiles(params.SERVER_KUBE_CONFIG, ".kube")
+                    helmUtils.majorChartVersionsCompare("${HELM_CMD}","${HELM_CHART_DIR}")
+                }
+
+                echo 'Init Helm:'
+                script {
+                    initHelm("${KUBECTL_CMD}", "${HELM_CMD}")
+                }
+
+                echo "Creating namespace: ${HELM_INSTALL_NAMESPACE} and secret"
+                sh "${KUBECTL_CMD} create namespace ${HELM_INSTALL_NAMESPACE} || true"
+                sh "${KUBECTL_CMD} create secret docker-registry ${APPLICATION_NAME}-secret \
+                    --docker-server=armdocker.rnd.ericsson.se \
+                    --docker-username=${CREDENTIALS_SEKA_ARTIFACTORY_USR} \
+                    --docker-password=${CREDENTIALS_SEKA_ARTIFACTORY_PSW} \
+                    -n ${HELM_INSTALL_NAMESPACE} || true"
+
+                script {
+                    echo 'Add jenkins scripts to workspace:'
+                    utils.addJenkinsScriptsToWs()
+
+                    sh "printenv > printenv.log"
+                    archiveArtifacts 'printenv.log'
+                }
+            }
+        }
+        stage('Install Known Good Baseline') {
+            steps{
+                script{
+                    current_stage = env.STAGE_NAME
+                    installKnownGoodBaseline("${KUBECTL_CMD}", "${HELM_CMD}")
+                }
+            }
+        }
+        stage('Update Helm Chart') {
+            when {
+                expression { params.CHART_NAME != "" }
+            }
+            steps {
+                script {
+                    current_stage = env.STAGE_NAME
+                    utils.updateHelmChart()
+                    utils.setHasHelmDependencyChanged("${HELM_CHART_DIR}")
+
+                    if (HELM_DEPENDENCY_CHANGED) {
+                        echo 'Increment Chart Version Locally:'
+                        sh "scripts/increment_chart_version.py --appChartDir=${HELM_CHART_DIR}"
+                    } else {
+                        echo 'No changes to Helm Chart -> Chart version not incremented.'
+                    }
+                }
+            }
+        }
+        stage('Download Chart Requirements') {
+            steps {
+                script {
+                    current_stage = env.STAGE_NAME
+                }
+                echo 'Download Chart Requirements'
+                sh """
+                    sudo chmod +x ${WORKSPACE}/scripts/common_functions.py
+                    sudo chmod +x ${WORKSPACE}/scripts/download_chart_requirements.py
+                    scripts/download_chart_requirements.py --appChartDir=$HELM_CHART_DIR --helmCommand='${HELM_CMD}' --armUserName=${CREDENTIALS_SEKA_ARTIFACTORY_USR} --armUserToken=${CREDENTIALS_SEKA_ARTIFACTORY_PSW} --armSekiUser=${CREDENTIALS_SERO_ARTIFACTORY_USR} --armSekiToken=${CREDENTIALS_SERO_ARTIFACTORY_PSW}
+                """
+            }
+        }
+        stage('Helm Upgrade') {
+            steps {
+                script{
+                    current_stage = env.STAGE_NAME
+                    helmUpgrade("${HELM_CMD}", "GAZ")
+                }
+            }
+        }
+        stage('E2E Test') {
+            when {
+                expression { (params.EXECUTE_TAF_TESTS && (params.CHART_REPO.contains("proj-eric-oss-central-drop-helm") || params.CHART_REPO.contains("proj-adp-gs-all-helm")) && !params.PRE_CODE_REVIEW) }
+                not {
+                    allOf {
+                        expression {helmUtils.isMajorVersionChanged()}
+                        expression {!params.ADPGS_AUTO_UPDATE_MAJOR_VERSIONS_ENABLED}
+                        expression {params.CHART_REPO.contains("proj-eric-oss-central-drop-helm")}
+                        expression { HELM_DEPENDENCY_CHANGED }
+                    }
+                }
+            }
+            steps {
+                script {
+                    current_stage = env.STAGE_NAME
+                    echo "Emulate launching stage 'Execute E2E Test'... Done"
+                }
+            }
+        }
+        stage('Commit Changes') {
+            when {
+                expression { params.CHART_NAME != "" }
+                expression { HELM_DEPENDENCY_CHANGED }
+            }
+            steps {
+                script {
+                    current_stage = env.STAGE_NAME
+                }
+                sh """
+                    sudo chmod +x ${WORKSPACE}/scripts/commit_chart_changes.py
+                    scripts/commit_chart_changes.py --appChartDir=${HELM_CHART_DIR}
+                """
+            }
+        }
+        stage('Lint') {
+            steps {
+                script {
+                    current_stage = env.STAGE_NAME
+                }
+                echo 'Lint and Helm Design Rules Check:'
+                lint_supress_output()
+            }
+        }
+        stage('Publish') {
+            when {
+                expression { params.CHART_NAME != "" }
+                expression { HELM_DEPENDENCY_CHANGED }
+            }
+            steps {
+                script {
+                    current_stage = env.STAGE_NAME
+                    sh """
+                        sudo chmod +x ${WORKSPACE}/scripts/uploadScript.py
+                        python scripts/uploadScript.py -w ${env.WORKSPACE} --repoRoot=${env.WORKSPACE}/charts --chartName=${APPLICATION_NAME} --appChartDir=${APPLICATION_NAME} --appHelmRepo=$HELM_CHART_REPO --armUserName=${CREDENTIALS_SEKA_ARTIFACTORY_USR} --armUserToken=${CREDENTIALS_SEKA_ARTIFACTORY_PSW} --chartName=$APPLICATION_NAME --helm='${HELM_CMD}'
+                    """
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                if (!params.PRE_CODE_REVIEW) {
+                    try {
+                        echo 'Modify the build description'
+                        def versionMatcher = manager.getLogMatcher('.*("downloadUri" : )(.*eric-oss-central-baseline-)(.*).tgz",')
+                        if (versionMatcher != null) {
+                            BOB_VERSION = versionMatcher.group(3)
+                            CHART_NAME_VERSION = "${APPLICATION_NAME}-${BOB_VERSION}.tgz"
+                        }
+                        def urlMatcher = manager.getLogMatcher('.*("downloadUri" : )(.*),')
+                        if (urlMatcher != null) {
+                            CHART_DOWNLOAD_LINK = urlMatcher.group(2)
+                            currentBuild.description = "Triggered by ${CHART_NAME}:${CHART_VERSION} <br> SON Parent Chart Version: ${BOB_VERSION}<br><a href=${CHART_DOWNLOAD_LINK}>${CHART_NAME_VERSION}</a>"
+                        }
+                    }
+                    catch (ignored) {
+                    }
+                }
+            }
+        }
+        failure {
+            script {
+                if (!params.PRE_CODE_REVIEW) {
+                    emailext to: "${env.NOTIFY_EMAIL}", recipientProviders: [culprits(), developers(), requestor(), brokenBuildSuspects()], subject: "FAILURE: ${currentBuild.fullDisplayName}", body: "<b>Jenkins job failed:</b><br><br>Project: ${env.JOB_NAME}<br>Build Number: ${env.BUILD_NUMBER}<br>${env.BUILD_URL}", mimeType: 'text/html'
+                }
+                if (current_stage.contains("Install Known Good Baseline") || current_stage.contains("Helm Upgrade") || current_stage.contains("Execute test Microservice k8s rollout Deployments")) {
+                    script{
+                        current_stage = env.STAGE_NAME
+                        rollBackServiceRelease("${KUBECTL_CMD}", "${HELM_CMD}")
+                    }
+                }
+            }
+        }
+        success {
+            cleanWs()
+        }
+    }
+}
+
+def rollBackServiceRelease(String kubectl_cmd, String helm_cmd) {
+    try{
+        sh "${helm_cmd} rollback $APPLICATION_NAME 0 --force"
+    }
+    catch(e){
+         cleanupHelmRelease("${kubectl_cmd}", "${helm_cmd}")
+    }
+}
+
+def cleanupHelmRelease(String kubectl_cmd, String helm_cmd) {
+    echo 'Cleanup Helm Release after Install/Upgrade'
+    sh "${helm_cmd} delete --purge $APPLICATION_NAME || true"
+    echo 'Sleep for 1 minute to allow releases to delete.'
+    sh "sleep 60"
+
+    sh "${kubectl_cmd} delete pvc -l release=${APPLICATION_NAME} -n ${HELM_INSTALL_NAMESPACE}"
+    sh "${kubectl_cmd} delete pvc -l \"app.kubernetes.io/instance=${APPLICATION_NAME}\" -n ${HELM_INSTALL_NAMESPACE} || true"
+
+    sh "${kubectl_cmd} delete pvc -l app=eric-data-search-engine -n ${HELM_INSTALL_NAMESPACE} || true"
+    sh "${kubectl_cmd} delete pv \$(${kubectl_cmd} get pv|grep 'eric-pm-events-spark'|cut -d ' ' -f 1|awk '{print}') || true"
+    sh "${kubectl_cmd} delete pv \$(${kubectl_cmd} get pv|grep 'ddcdata'|cut -d ' ' -f 1|awk '{print}') || true"
+
+    echo 'Sleep for 3 minutes to allow pvcs and pvs to delete and for OpenStack volumes to un-attach.'
+    sh "sleep 180"
+}
+
+def helmUpgrade(String helm_cmd, String server){
+    sh "${helm_cmd} upgrade --install $APPLICATION_NAME $HELM_CHART_DIR --namespace $HELM_INSTALL_NAMESPACE --set ${HELM_SET} --wait --timeout $HELM_INSTALL_TIMEOUT --debug --dry-run > helm-install-dry-run-$server-upgrade.log"
+    sh "${helm_cmd} upgrade --install $APPLICATION_NAME $HELM_CHART_DIR --namespace $HELM_INSTALL_NAMESPACE --set ${HELM_SET} --wait --timeout $HELM_INSTALL_TIMEOUT"
+}
+
+def initHelm(String kubectl_cmd, String helm_cmd){
+    echo 'Clean up any released pvs'
+    sh "${kubectl_cmd} delete pv \$(${kubectl_cmd} get pv|grep Released|cut -d ' ' -f 1|awk '{print}')|| true"
+    sh "${helm_cmd} init --client-only"
+    sh "${helm_cmd} repo add ${APPLICATION_NAME}-repo $HELM_CHART_REPO --username ${CREDENTIALS_SEKA_ARTIFACTORY_USR} --password ${CREDENTIALS_SEKA_ARTIFACTORY_PSW}"
+    sh "${helm_cmd} repo update"
+    sh "${helm_cmd} ls --all"
+}
+
+def installKnownGoodBaseline(String kubectl_cmd, String helm_cmd) {
+    echo "Installing KGB with the option ${KGB_VERSION}"
+    sh "${kubectl_cmd} create namespace ${HELM_INSTALL_NAMESPACE} || true"
+    sh "${kubectl_cmd} create secret docker-registry ${APPLICATION_NAME}-secret --docker-server=armdocker.rnd.ericsson.se --docker-username=${CREDENTIALS_SEKA_ARTIFACTORY_USR} --docker-password=${CREDENTIALS_SEKA_ARTIFACTORY_PSW} -n ${HELM_INSTALL_NAMESPACE} || true"
+    waitUntil {
+        script {
+            try {
+                sh "${helm_cmd} upgrade --install $APPLICATION_NAME ${APPLICATION_NAME}-repo/${APPLICATION_NAME} ${KGB_VERSION} --namespace $HELM_INSTALL_NAMESPACE --set ${HELM_SET} --wait --timeout $HELM_INSTALL_TIMEOUT"
+                return true
+            }
+            catch (e) {
+                cleanupHelmRelease("${kubectl_cmd}", "${helm_cmd}")
+                return false
+            }
+        }
+    }
+}
+
+def injectK8sFiles(String kubeConfig, String target){
+    sh "echo Injecting Kubernetes config file ${kubeConfig}"
+    configFileProvider([configFile(fileId: "${kubeConfig}", targetLocation: "${env.WORKSPACE}/${target}/")]) {
+    }
+}
+
+def lint_supress_output() {
+    sh ''': $(docker run --volume ${PWD}:${PWD} --workdir ${PWD} armdocker.rnd.ericsson.se/sandbox/adp-staging/adp-cicd/common-library-adp-helm-dr-check:latest helm-dr-check \
+        -DhelmDesignRule.feature.dependency=1 \
+        -h=${PWD}/charts/${APPLICATION_NAME} \
+        -o=${PWD} >/dev/null)'''
+}

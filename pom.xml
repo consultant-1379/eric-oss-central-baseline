@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.ericsson.oss.services.sonom</groupId>
+        <artifactId>son-parent</artifactId>
+        <version>1.0.12</version>
+    </parent>
+
+    <groupId>com.ericsson.oss.services.sonom</groupId>
+    <artifactId>eric-oss-central-baseline</artifactId>
+    <version>1.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>[${project.artifactId}] JEE6 project</name>
+
+    <scm>
+        <developerConnection>${ericsson.scm.url}</developerConnection>
+        <connection>${ericsson.scm.url}</connection>
+        <tag>HEAD</tag>
+    </scm>
+
+    <!-- Deployment of versioned documentation -->
+    <distributionManagement>
+        <site>
+            <id>site</id>
+            <name>Site</name>
+            <url>${site.url}/eric-oss-central-baseline/${project.version}</url>
+        </site>
+    </distributionManagement>
+
+    <properties>
+        <ericsson.scm.url>
+            scm:git:[fetch=]ssh://gerrit.ericsson.se:29418/OSS/com.ericsson.oss.ci/eric-oss-central-baseline[push=]ssh://gerrit.ericsson.se:29418/OSS/com.ericsson.oss.ci/eric-oss-central-baseline
+        </ericsson.scm.url>
+    </properties>
+
+    <!-- Profiles for site documentation -->
+    <profiles>
+        <!-- Profile to deploy latest site -->
+        <profile>
+            <id>site_latest</id>
+            <distributionManagement>
+                <site>
+                    <id>site</id>
+                    <name>Site</name>
+                    <url>${site.url}/eric-oss-central-baseline/latest</url>
+                </site>
+            </distributionManagement>
+        </profile>
+
+        <!-- Profile to stage site for review -->
+        <profile>
+            <id>site_review</id>
+            <distributionManagement>
+                <site>
+                    <id>site</id>
+                    <name>Site</name>
+                    <url>${site.url}</url>
+                </site>
+            </distributionManagement>
+        </profile>
+    </profiles>
+</project>

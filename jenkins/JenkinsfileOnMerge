@@ -1,0 +1,125 @@
+pipeline {
+    agent {
+        node {
+            label 'Jenkins_gazelles_podj'
+        }
+    }
+    options {
+        timestamps()
+    }
+    environment {
+        CHART_NAME = "eric-oss-central-baseline"
+        CREDENTIALS_SEKA_ARTIFACTORY = credentials('osscnciArtifactoryApiKeySELI')
+        CREDENTIALS_SERO_ARTIFACTORY = credentials('osscnciArtifactoryApiKeySERO')
+        HELM_CMD = "docker run --rm \
+            -v ${env.WORKSPACE}/.kube/config:/root/.kube/config \
+            -v ${env.WORKSPACE}/helm-home:/root/.helm \
+            -v ${env.WORKSPACE}:${env.WORKSPACE} \
+            ${env.HELM_DOCKER_IMAGE}"
+        HELM_CHART_REPO = "https://arm.seli.gic.ericsson.se/artifactory/proj-eric-oss-central-drop-helm"
+        HELM_CHART_DIR = "${env.WORKSPACE}/charts/${CHART_NAME}"
+        IS_CI_SKIP = sh(script: "git log -1 | grep '\\[ci-skip\\]'", returnStatus: true)
+    }
+    stages {
+        stage('Clean') {
+            steps {
+                sh '''
+                    echo "Cleanup workspace:"
+                    sudo chmod -fR 777 "${WORKSPACE}"
+                    sudo rm -Rf ./*
+                '''
+
+                echo 'SCM Checkout:'
+                checkout scm
+            }
+        }
+        stage('Init') {
+            when {
+                expression { env.IS_CI_SKIP != "0" }
+            }
+            steps {
+                sh 'rm -rf helm-home'
+                sh "mkdir helm-home"
+                sh '${HELM_CMD} init --client-only'
+                sh '${HELM_CMD} repo add baseline-common-repo ${HELM_CHART_REPO} --username ${CREDENTIALS_SEKA_ARTIFACTORY_USR} --password ${CREDENTIALS_SEKA_ARTIFACTORY_PSW}'
+                sh '${HELM_CMD} repo update'
+
+                script {
+                    sh "printenv > printenv.log"
+                    archiveArtifacts 'printenv.log'
+                }
+            }
+        }
+        stage('Update Helm Chart') {
+            when {
+                expression { env.IS_CI_SKIP != "0" }
+            }
+            steps {
+                echo 'Increment Chart Version Locally'
+                sh """
+                    sudo chmod +x ${WORKSPACE}/scripts/increment_chart_version.py
+                    scripts/increment_chart_version.py --appChartDir=$HELM_CHART_DIR
+                """
+            }
+        }
+        stage('Download Chart Requirements') {
+            when {
+                expression { env.IS_CI_SKIP != "0" }
+            }
+            steps {
+                sh """
+                    sudo chmod +x ${WORKSPACE}/scripts/download_chart_requirements.py
+                    scripts/download_chart_requirements.py --appChartDir=$HELM_CHART_DIR --helmCommand='${HELM_CMD}' --armUserName=${CREDENTIALS_SEKA_ARTIFACTORY_USR} --armUserToken=${CREDENTIALS_SEKA_ARTIFACTORY_PSW} --armSekiUser=${CREDENTIALS_SERO_ARTIFACTORY_USR} --armSekiToken=${CREDENTIALS_SERO_ARTIFACTORY_PSW}
+                """
+            }
+        }
+        stage('Commit Changes') {
+            when {
+                expression { env.IS_CI_SKIP != "0" }
+            }
+            steps {
+                sh """
+                    sudo chmod +x ${WORKSPACE}/scripts/commit_chart_changes.py
+                    scripts/commit_chart_changes.py --appChartDir=${HELM_CHART_DIR}
+                """
+            }
+        }
+        stage('Publish') {
+            when {
+                expression { env.IS_CI_SKIP != "0" }
+            }
+            steps {
+                sh """
+                    sudo chmod +x ${WORKSPACE}/scripts/uploadScript.py
+                    python scripts/uploadScript.py -w ${env.WORKSPACE} --repoRoot=${env.WORKSPACE}/charts --chartName=${CHART_NAME} --appChartDir=${CHART_NAME} --appHelmRepo=$HELM_CHART_REPO --armUserName=${CREDENTIALS_SEKA_ARTIFACTORY_USR} --armUserToken=${CREDENTIALS_SEKA_ARTIFACTORY_PSW} --chartName=${CHART_NAME} --helm='${HELM_CMD}'
+                """
+            }
+        }
+    }
+    post {
+        always {
+            echo 'Modify the build description:'
+            script {
+                if (env.IS_CI_SKIP != "0") {
+                    try {
+                        def matcher = manager.getLogMatcher('.*(INFO Updating Chart.yaml with new version:) (.*)')
+                        if (matcher != null) {
+                            currentBuild.description = matcher.group(2)
+                        }
+                    }
+                    catch (ignored) {}
+                } else {
+                    currentBuild.description = "Commit message contains [ci-skip]"
+                }
+            }
+            echo 'Delete workspace when build is done, however do not fail the build if cleanup fails:'
+            cleanWs notFailBuild: true
+        }
+        failure {
+            step([$class: 'ClaimPublisher'])
+            script {
+                emailext to: "${env.NOTIFY_EMAIL}", recipientProviders: [culprits(), developers(), requestor(), brokenBuildSuspects()], subject: "FAILURE: ${currentBuild.fullDisplayName}", body: "<b>Jenkins job failed:</b><br><br>Project: ${env.JOB_NAME}<br>Build Number: ${env.BUILD_NUMBER}<br>${env.BUILD_URL}", mimeType: 'text/html'
+            }
+        }
+    }
+}

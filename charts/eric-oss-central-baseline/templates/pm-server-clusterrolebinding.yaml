@@ -1,0 +1,21 @@
+{{- if index .Values "eric-pm-server" "rbac" "clusterMonitoring" "enabled" }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app: {{ template "eric-oss-central-baseline.name" . }}
+    chart: {{ template "eric-oss-central-baseline.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+  name: {{ template "eric-oss-central-baseline.name" . }}
+  annotations:
+{{- include "eric-oss-central-baseline.product-info" . | indent 4 }}
+roleRef:
+  kind: ClusterRole
+  name: {{ template "eric-oss-central-baseline.name" . }}
+  apiGroup: rbac.authorization.k8s.io
+subjects:
+  - kind: ServiceAccount
+    name: {{ template "eric-oss-central-baseline.service.name" index .Values "eric-pm-server" }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

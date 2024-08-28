@@ -1,0 +1,17 @@
+dependencies:
+- name: eric-log-transformer
+  repository: https://arm.rnd.ki.sw.ericsson.se/artifactory/proj-adp-gs-all-helm/
+  version: 4.2.0+15
+- name: eric-log-shipper
+  repository: https://arm.rnd.ki.sw.ericsson.se/artifactory/proj-adp-gs-all-helm/
+  version: 3.1.0-1
+- name: eric-pm-server
+  repository: https://arm.rnd.ki.sw.ericsson.se/artifactory/proj-adp-gs-all-helm/
+  version: 2.0.0+13
+- condition: eric-data-document-database-pg.enabled
+  name: eric-data-document-database-pg
+  repository: https://arm.rnd.ki.sw.ericsson.se/artifactory/proj-adp-gs-all-helm/
+  version: 2.3.0+57
+- name: eric-oss-central-service
+  repository: https://arm.epk.ericsson.se/artifactory/proj-eric-oss-central-drop-helm
+  version: 11.0.1-6

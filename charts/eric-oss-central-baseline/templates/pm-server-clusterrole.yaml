@@ -1,0 +1,46 @@
+{{- if index .Values "eric-pm-server" "rbac" "clusterMonitoring" "enabled" }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ template "eric-oss-central-baseline.name" . }}
+  labels:
+    app: {{ template "eric-oss-central-baseline.name" . }}
+    chart: {{ template "eric-oss-central-baseline.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+  annotations:
+{{- include "eric-oss-central-baseline.product-info" . | indent 4 }}
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+  - apiGroups:
+      - "extensions"
+    resources:
+      - ingresses/status
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - nonResourceURLs:
+      - "/metrics"
+    verbs:
+      - get
+{{- end }}
